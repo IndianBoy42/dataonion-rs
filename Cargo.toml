@@ -9,6 +9,8 @@ edition = "2018"
 [dependencies]
 openssl = "0.10.30"
 itertools = "0.9.0"
+derive_more = "0.99.9"
+derivative = "2.1.1"
 
 [dev-dependencies]
 criterion = "0.3.2"

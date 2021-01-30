@@ -9,6 +9,9 @@
 #![feature(const_generics)]
 #![feature(const_generic_impls_guard)]
 
+#[macro_use]
+extern crate derivative;
+use crate::Tomtel::Machine;
 use itertools::{izip, unfold, Itertools};
 use openssl::aes::unwrap_key;
 use openssl::symm::decrypt;
@@ -19,8 +22,10 @@ use std::fmt::{self, Display};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::net::Ipv4Addr;
+use std::str::from_utf8;
 use std::{array, path::Path};
 // use std::str::from_utf8;
+use io::{stdout, Stdout};
 use openssl::aes::AesKey;
 use openssl::symm::Cipher;
 
@@ -104,7 +109,7 @@ fn base85_parse(block: [u8; 5]) -> [u8; 4] {
 fn base85_parse2(block: [u8; 5]) -> [u8; 4] {
     block
         .iter()
-        // .inspect(|&&v| print!("{:?} {:?} ", v as char, v))
+        // .inspect(|&&v| print!("({:?} {:?}) ",  v as char, v))
         .map(|&a| a - b'!')
         .map(u32::from)
         // .inspect(|&v| println!("{:?}", v))
@@ -213,7 +218,7 @@ fn layer3_decode(buffer: &[u8]) -> Vec<u8> {
     //     .map(|(&a, &b)| a ^ b)
     //     .collect();
     let key = {
-        const KNOWN: &[u8] = b"==[ Layer 4/5: Network Traffic ]============================\n\n";
+        const KNOWN: &[u8] = b"==[ Layer 4/6: Network Traffic ]============>===============\n\n";
         let enced = &buffer[0..32];
         let mut key = [0_u8; 32];
         izip!(&mut key, KNOWN, enced).for_each(|(k, a, b)| *k = a ^ b);
@@ -359,10 +364,14 @@ fn layer4_decode_one(buf: &[u8]) -> (Res<&[u8]>, &[u8]) {
         len = iph.length as usize;
         // println!("{}", iph);
 
+        let data = &buf[(IP_HEADER_SIZE + UDP_HEADER_SIZE)..iph.length as usize];
+
         if iph.src != EXPECT_SRC_IP || iph.dst != EXPECT_DST_IP {
+            // println!("{:?}", from_utf8(data)?);
             return StrError::err("IP Src/Dst Address Incorrect");
         }
         if !calc_checksum(&buf[0..IP_HEADER_SIZE]) != 0 {
+            // println!("{:?}", from_utf8(data)?);
             return StrError::err("IP Checksum Fail");
         }
 
@@ -373,15 +382,14 @@ fn layer4_decode_one(buf: &[u8]) -> (Res<&[u8]>, &[u8]) {
         // println!("{:?}", udph);
 
         if udph.dst != EXPECT_DST_PORT {
+            // println!("{:?}", from_utf8(data)?);
             return StrError::err("IP Dst Port Incorrect");
         }
 
         if !udp_checksum(buf) != 0 {
-            // println!("{:x}", chk);
+            // println!("{:?}", from_utf8(data)?);
             return StrError::err("UDP Checksum Fail");
         }
-
-        let data = &buf[(IP_HEADER_SIZE + UDP_HEADER_SIZE)..];
 
         // println!("{:?}", from_utf8(data)?);
 
@@ -398,6 +406,12 @@ fn layer4_decode(b: &[u8]) -> Vec<u8> {
             let (pack, rest) = layer4_decode_one(&left);
             *left = rest;
             pack.unwrap_or(&[])
+            // match pack {
+            // Ok(pack) => pack,
+            // Err(e) => {
+            // dbg!(e); &[]
+            // }
+            // }
         })
     })
     .fold(Vec::with_capacity(100_000), |mut vec, data| {
@@ -424,7 +438,298 @@ fn layer5_decode(layer1: &[u8]) -> Vec<u8> {
         keybuf
     };
 
-    decrypt(Cipher::aes_256_cbc(), &unwrapped_key, Some(iv), data).unwrap()
+    decrypt(Cipher::aes_256_ctr(), &unwrapped_key, Some(iv), data).unwrap()
+}
+
+mod Tomtel {
+    use std::fmt::Debug;
+    use std::fmt::Display;
+    use std::io::stdout;
+    use std::time::Duration;
+    use std::{
+        convert::TryInto,
+        io::{Stdout, Write},
+        ops::BitXor,
+        thread::sleep,
+    };
+    #[derive(Debug, Clone, Default)]
+    struct Regs {
+        a: u8,    //Accumulation register -- Used to store the result
+        b: u8,    //Operand register -- This is 'right hand side' of
+        c: u8,    //Count/offset register -- Holds an offset or index
+        d: u8,    //General purpose register
+        e: u8,    //General purpose register
+        f: u8,    //Flags register -- Holds the result of the
+        la: u32,  //General purpose register
+        lb: u32,  //General purpose register
+        lc: u32,  //General purpose register
+        ld: u32,  //General purpose register
+        ptr: u32, //Pointer to memory -- holds a memory address which
+        pc: u32,  //Program counter -- holds a memory address that
+    }
+
+    #[derive(Derivative)]
+    #[derivative(Debug)]
+    pub(crate) struct Machine<OStream: Write> {
+        regs: Regs,
+        #[derivative(Debug = "ignore")]
+        memory: Vec<u8>,
+        #[derivative(Debug = "ignore")]
+        output: OStream,
+
+        pub(crate) halted: bool,
+    }
+
+    impl Machine<Stdout> {
+        pub fn std(code: Vec<u8>) -> Self {
+            Machine {
+                regs: Regs::default(),
+                memory: code,
+                output: stdout(),
+                halted: false,
+            }
+        }
+    }
+
+    impl<O: Write> Machine<O> {
+        pub fn new(code: Vec<u8>, o: O) -> Self {
+            Machine {
+                regs: Regs::default(),
+                memory: code,
+                output: o,
+                halted: false,
+            }
+        }
+    }
+
+    const OPC_ADD: u8 = 0xC2;
+    const OPC_APTR: u8 = 0xE1;
+    const OPC_CMP: u8 = 0xC1;
+    const OPC_HALT: u8 = 0x01;
+    const OPC_JEZ: u8 = 0x21;
+    const OPC_JNZ: u8 = 0x22;
+    const OPC_OUT: u8 = 0x02;
+    const OPC_SUB: u8 = 0xC3;
+    const OPC_XOR: u8 = 0xC4;
+    // const OPC_MV: u8 = 0b01DDDSSS;
+    // const OPC_MV32: u8 = 0b10DDDSSS;
+    // const OPC_MVI: u8 = 0b01DDD000;
+    // const OPC_MVI32: u8 = 0b10DDD000;
+
+    impl<O: Write> Machine<O> {
+        fn pc(&self) -> u8 {
+            let r = self.memory[self.regs.pc as usize];
+            print!("(INS @ {} = {r:x}  {r:b}) ", self.regs.pc, r = r); // Tomtel Assembly Debugging
+            r
+        }
+        fn par(&self, i: usize) -> u8 {
+            let r = self.memory[self.regs.pc as usize + i];
+            print!("(IMM8={}) ", r); // Tomtel Assembly Debugging
+            r
+        }
+        fn par32(&self, i: usize) -> u32 {
+            let r = u32::from_le_bytes(
+                self.memory[self.regs.pc as usize + i..][..4]
+                    .try_into()
+                    .unwrap(),
+            );
+            print!("(IMM32={}) ", r); // Tomtel Assembly Debugging
+            r
+        }
+        fn reg_print<T: Display>(r: T) -> T {
+            print!("(REG={}) ", r); // Tomtel Assembly Debugging
+            r
+        }
+        fn reg(&mut self, i: u8) -> &mut u8 {
+            match i {
+                1 => Self::reg_print(&mut self.regs.a),
+                2 => Self::reg_print(&mut self.regs.b),
+                3 => Self::reg_print(&mut self.regs.c),
+                4 => Self::reg_print(&mut self.regs.d),
+                5 => Self::reg_print(&mut self.regs.e),
+                6 => Self::reg_print(&mut self.regs.f),
+                7 => {
+                    let r = &mut self.memory[self.regs.ptr as usize + self.regs.c as usize];
+                    print!("(MEM @ {}+{} = {}) ", self.regs.ptr, self.regs.c, r); // Tomtel Assembly Debugging
+                    r
+                }
+                _ => unreachable!("Invalid Register, I dont even care rn"),
+            }
+        }
+        fn reg32(&mut self, i: u8) -> &mut u32 {
+            match i {
+                1 => Self::reg_print(&mut self.regs.la),
+                2 => Self::reg_print(&mut self.regs.lb),
+                3 => Self::reg_print(&mut self.regs.lc),
+                4 => Self::reg_print(&mut self.regs.ld),
+                5 => Self::reg_print(&mut self.regs.ptr),
+                6 => Self::reg_print(&mut self.regs.pc),
+                _ => unreachable!("Invalid Register32, I dont even care rn"),
+            }
+        }
+        fn op(&mut self, f: impl Fn(u8, u8) -> u8) {
+            print!("(({}, {})) ", self.regs.a, self.regs.b); // Tomtel Assembly Debugging
+            self.regs.a = f(self.regs.a, self.regs.b);
+            print!("(-> {}) ", self.regs.a); // Tomtel Assembly Debugging
+        }
+        fn mv_dst(&self, opc: u8) -> u8 {
+            (opc & 0b0011_1000) >> 3
+        }
+        fn mv_src(&self, opc: u8) -> u8 {
+            opc & 0b0000_0111
+        }
+        fn dst(&mut self, opc: u8) -> &mut u8 {
+            let dst = self.mv_dst(opc);
+            print!("(DST:{}) ", dst); // Tomtel Assembly Debugging
+            self.reg(dst)
+        }
+        fn dst32(&mut self, opc: u8) -> &mut u32 {
+            let dst = self.mv_dst(opc);
+            print!("(DST:{}) ", dst); // Tomtel Assembly Debugging
+            self.reg32(dst)
+        }
+        fn src(&mut self, opc: u8) -> (u8, u32) {
+            let src = self.mv_src(opc);
+            print!("(SRC:{}) ", src); // Tomtel Assembly Debugging
+            if src == 0 {
+                (self.par(1), 1)
+            } else {
+                (*self.reg(src), 0)
+            }
+        }
+        fn src32(&mut self, opc: u8) -> (u32, u32) {
+            let src = self.mv_src(opc);
+            print!("(SRC:{}) ", src); // Tomtel Assembly Debugging
+            if src == 0 {
+                (self.par32(1), 4)
+            } else {
+                (*self.reg32(src), 0)
+            }
+        }
+        pub fn step(&mut self) {
+            let pc = match self.pc() {
+                OPC_HALT => {
+                    print!("(OP:HALT) "); // Tomtel Assembly Debugging
+                    self.halted = true;
+                    self.regs.pc
+                }
+                OPC_ADD => {
+                    print!("(OP:ADD) "); // Tomtel Assembly Debugging
+                    self.op(u8::wrapping_add);
+                    self.regs.pc + 1
+                }
+                OPC_SUB => {
+                    print!("(OP:SUB) "); // Tomtel Assembly Debugging
+                    self.op(|a, b| {
+                        let res = i32::from(a) - i32::from(b);
+                        (if res < 0 { res + 255 } else { res }) as u8
+                    });
+                    self.regs.pc + 1
+                }
+                OPC_XOR => {
+                    print!("(OP:XOR) "); // Tomtel Assembly Debugging
+                    self.op(BitXor::bitxor);
+                    self.regs.pc + 1
+                }
+                OPC_APTR => {
+                    print!("(OP:APTR) "); // Tomtel Assembly Debugging
+                    self.regs.ptr += self.par(1) as u32;
+                    self.regs.pc + 2
+                }
+                OPC_CMP => {
+                    if self.regs.a == self.regs.b {
+                        self.regs.f = 0;
+                    } else {
+                        self.regs.f = 1;
+                    }
+                    print!(// Tomtel Assembly Debugging
+                        "((OP:CMP) {} ?= {} -> {}) ",
+                        self.regs.a, self.regs.b, self.regs.f
+                    );
+                    self.regs.pc + 1
+                }
+                OPC_JEZ => {
+                    print!("((OP:JEZ) {}) ", self.regs.f); // Tomtel Assembly Debugging
+                    if self.regs.f == 0 {
+                        print!("(JUMPED) "); // Tomtel Assembly Debugging
+                        self.par32(1)
+                    } else {
+                        self.regs.pc + 5
+                    }
+                }
+                OPC_JNZ => {
+                    print!("((OP:JNZ) {}) ", self.regs.f); // Tomtel Assembly Debugging
+                    if self.regs.f == 0 {
+                        self.regs.pc + 5
+                    } else {
+                        print!("(JUMPED) "); // Tomtel Assembly Debugging
+                        self.par32(1)
+                    }
+                }
+                OPC_OUT => {
+                    print!("((OP:OUT) {} {}) ", self.regs.a, self.regs.a as char); // Tomtel Assembly Debugging
+                    self.output
+                        .write_all(&[self.regs.a])
+                        .expect("Tomtel Output Stream Failed");
+                    self.regs.pc + 1
+                }
+                opc => {
+                    if opc & 0b1111_1000 == 0b1000_0000 | (6 << 3) {
+                        // JMP IMM32 JMP REG
+                        print!("(OP:JMP) "); // Tomtel Assembly Debugging
+                        print!("(JUMPED) "); // Tomtel Assembly Debugging
+                        let (src32, inc) = self.src32(opc);
+                        *self.dst32(opc) = src32;
+                        self.regs.pc
+                    } else if opc & 0b1100_0000 == 0b0100_0000 {
+                        print!("(OP:MV) "); // Tomtel Assembly Debugging
+                                            //MV MVI
+                        let (src, inc) = self.src(opc);
+                        *self.dst(opc) = src;
+                        self.regs.pc + inc + 1
+                    } else if opc & 0b1100_0000 == 0b1000_0000 {
+                        //MV32 MVI32
+                        print!("(OP:MV32) "); // Tomtel Assembly Debugging
+                        let (src32, inc) = self.src32(opc);
+                        *self.dst32(opc) = src32;
+                        self.regs.pc + inc + 1
+                    } else {
+                        println!("Invalid Machine Code @ {} : {:x}", self.regs.pc, self.pc());
+                        self.halted=true;
+                        self.regs.pc
+                    }
+                }
+            };
+            println!(); // Tomtel Assembly Debugging
+                        // sleep(Duration::from_millis(200));
+
+            self.regs.pc = pc;
+
+            println!("{:?}\n", self); // Tomtel Assembly Debugging
+        }
+    }
+}
+
+fn layer6_decode(input: &[u8]) -> Vec<u8> {
+    // let input = { // Hello World
+    //     let mut buf = String::with_capacity(1000);
+    //     File::open("exprg.txt")
+    //         .unwrap()
+    //         .read_to_string(&mut buf)
+    //         .unwrap();
+    //     buf.split_ascii_whitespace()
+    //         .map(|c| u8::from_str_radix(c, 16).unwrap())
+    //         .collect_vec()
+    // };
+    let mut output = Vec::<u8>::with_capacity(100_000);
+    // let mut mach = Machine::new(input, &mut output);
+    let mut mach = Machine::new(input.to_vec(), &mut output);
+
+    while !mach.halted {
+        mach.step();
+    }
+
+    output
 }
 
 pub fn peel_all_layers() -> Res<()> {
@@ -439,6 +744,8 @@ pub fn peel_all_layers() -> Res<()> {
     peel_layer4()?;
 
     peel_layer5()?;
+
+    peel_layer6()?;
 
     Ok(())
 }
@@ -461,6 +768,41 @@ pub fn peel_all_layers2(input: &[u8]) -> Vec<u8> {
 }
 
 #[must_use]
+pub fn only_peel_layer6(buffer: &[u8]) -> Vec<u8> {
+    let layer1 = {
+        let mut layer1 = ascii85_decode(buffer);
+        layer1.extend_from_slice(&[0; 4]);
+        layer1
+    };
+    {
+        use std::fmt::Write as FmtWrite;
+        write_output(
+            "code6.txt",
+            layer1
+                .iter()
+                .fold(String::new(), |mut s, &b| {
+                    writeln!(&mut s, "0x{b:x} 0b{b:08b}", b = b).unwrap();
+                    s
+                })
+                .bytes(),
+        )
+        .unwrap_or(());
+    }
+    layer6_decode(&layer1)
+}
+
+pub fn peel_layer6() -> Res<()> {
+    // println!("Starting Layer 5");
+    let buffer = read_input("input6.txt")?;
+    let layer6 = only_peel_layer6(&buffer);
+
+    // write_next_input
+    write_output("layer7.txt", layer6)?;
+
+    Ok(())
+}
+
+#[must_use]
 pub fn only_peel_layer5(buffer: &[u8]) -> Vec<u8> {
     let layer1 = ascii85_decode(buffer);
     layer5_decode(&layer1)
@@ -469,10 +811,10 @@ pub fn only_peel_layer5(buffer: &[u8]) -> Vec<u8> {
 pub fn peel_layer5() -> Res<()> {
     // println!("Starting Layer 5");
     let buffer = read_input("input5.txt")?;
-    let thecore = only_peel_layer5(&buffer);
+    let layer6 = only_peel_layer5(&buffer);
 
-    // write_next_input
-    write_output("thecore.txt", thecore)?;
+    write_next_input("input6.txt", &layer6)?;
+    write_output("layer6.txt", layer6)?;
 
     Ok(())
 }
